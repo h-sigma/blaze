@@ -710,7 +710,9 @@ pub fn held() -> u64 {
 /// free chunks it purged). The counted sum is only an upper bound: mimalloc's committed count is
 /// never lowered by a purge, and committed pages never touched are not resident.
 pub fn own() -> u64 {
-    own_of(&blaze_mem::tag::snapshot())
+    // The counters are read only where the system does not say: a reading folds every thread's
+    // tag lines, which the system's own count makes unnecessary.
+    blaze_mem::tag::resident().unwrap_or_else(|| own_of(&blaze_mem::tag::snapshot()))
 }
 
 /// [`own`], the counted sum taken from `snapshot` where the system does not say.
@@ -1223,6 +1225,23 @@ mod tests {
     /// calls, the arena's tests bytes held.
     #[global_allocator]
     static ALLOC: Counting<blaze_alloc_count::Counting> = Counting(blaze_alloc_count::Counting);
+
+    /// What the plane is told the process holds counts the pages blaze-mem commits for its
+    /// tables, frames and chunks: the global heap's count (`held`) never sees them.
+    #[test]
+    fn the_footprint_counts_the_pages_blaze_mem_committed_which_the_heap_never_sees() {
+        const BYTES: usize = 256 << 20;
+        let heap_before = held();
+        let before = own();
+        let region = blaze_mem::Region::reserve(BYTES, Tag::Other).expect("reserve");
+        region.ensure(BYTES).expect("commit");
+        let grew = own().saturating_sub(before);
+        let heap_grew = held().abs_diff(heap_before);
+        // Other tests allocate beside this one: only a margin well under BYTES is claimed.
+        assert!(grew >= BYTES as u64 - (32 << 20), "the footprint grew by {grew} of {BYTES}");
+        assert!(heap_grew < BYTES as u64 / 2, "the heap grew by {heap_grew}: it should not see the region");
+        drop(region);
+    }
 
     /// The test binary's allocator keeps no tags: every block counts outside any task.
     #[allow(unsafe_code, reason = "forwards to the counter's own GlobalAlloc calls")]

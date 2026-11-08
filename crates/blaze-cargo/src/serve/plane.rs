@@ -687,9 +687,16 @@ pub struct Plane<W: Work, P: Predict> {
     /// makes as last given to the plane ([`PlaneInput::Cap`]).
     pressure: blaze_graph::pressure::Pressured,
     capped: Option<u64>,
+    /// When the plane was last told what the process holds ([`Plane::hear_held`]).
+    held_at: Option<Duration>,
     /// Each request's live model, fed every record the plane says of it ([`Folds`]).
     folds: Folds,
 }
+
+/// The longest the plane goes without hearing what the process holds while no task ends
+/// ([`Plane::hear_held`]): memory grows between task ends (a front end filling its tables), and
+/// admission must see it within a few turns of the daemon's loop.
+const HELD_EVERY: Duration = Duration::from_millis(5);
 
 /// Each plane request's live model (`blaze_protocol::now`, docs/v2/plan/observe/build-view.md):
 /// a [`Fold`] made as the request opens ([`Plane::open`]), fed every record the plane says of
@@ -843,6 +850,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
             admitting: HashMap::new_in(Global), // alloc: the plane's, once
             pressure: blaze_graph::pressure::Pressured::default(),
             capped: None,
+            held_at: None,
             folds: Folds::new(),
         })
     }
@@ -853,7 +861,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// Whether the front ends are to be asked for a release for it
     /// ([`blaze_graph::pressure::Pressured::release_due`]).
     pub fn pressed(&mut self, at: Duration) -> bool {
-        self.pressure = self.pressure.pressed(ns(at), arena::held());
+        self.pressure = self.pressure.pressed(ns(at), arena::own());
         self.pressure.release_due(ns(at))
     }
 
@@ -1439,9 +1447,9 @@ impl<W: Work, P: Predict> Plane<W, P> {
             self.step(input)
                 .unwrap_or_else(|error| panic!("the plane refused the end of task {id}: {error}"));
         }
+        let ended = !ran.is_empty();
         self.ran = ran;
-        let held = PlaneInput::Held { at_ns: ns(at), bytes: arena::held() };
-        self.step(held).unwrap_or_else(|error| panic!("the plane refused what is held: {error}"));
+        self.hear_held(at, ended);
         // The pressure cap, given as it changes: on an event, and once it passes.
         let cap = self.pressure.cap(ns(at));
         if cap != self.capped {
@@ -1450,6 +1458,23 @@ impl<W: Work, P: Predict> Plane<W, P> {
             self.step(input)
                 .unwrap_or_else(|error| panic!("the plane refused the pressure cap: {error}"));
         }
+    }
+
+    /// Tells the plane what the process holds now: its footprint ([`arena::own`]), the global
+    /// heap and every page blaze-mem committed for the front end's tables, the frames and the
+    /// chunks, which [`arena::held`] never sees. Admission compares it with the budget, so a
+    /// footprint left out of it is memory no task is ever held back for. A system call and a
+    /// pass over every subsystem's counters, so it is taken when a task ended or
+    /// [`HELD_EVERY`] passed.
+    fn hear_held(&mut self, at: Duration, ended: bool) {
+        let due = ended
+            || self.held_at.is_none_or(|last| at < last || at - last >= HELD_EVERY);
+        if !due {
+            return;
+        }
+        self.held_at = Some(at);
+        let held = PlaneInput::Held { at_ns: ns(at), bytes: arena::own() };
+        self.step(held).unwrap_or_else(|error| panic!("the plane refused what is held: {error}"));
     }
 
     /// What happened since the last call, in order, swapped into `into`, which is empty: the

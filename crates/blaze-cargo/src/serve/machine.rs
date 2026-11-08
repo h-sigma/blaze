@@ -140,7 +140,7 @@ impl Machine {
             process: me,
             budget: budget.bytes,
             ceiling: ceiling.bytes,
-            held: blaze_graph::arena::held(),
+            held: blaze_graph::arena::own(),
             granted: 0,
             at_ns: wall_ns(),
             version: Label::head(
